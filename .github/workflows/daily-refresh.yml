@@ -1,0 +1,99 @@
+name: Daily dashboard refresh
+run-name: "Dashboard refresh · ${{ inputs.request_id || 'scheduled' }} · ${{ inputs.date || 'D-1' }} · ${{ inputs.dry_run && 'dry-run' || 'run' }}"
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Business date (YYYYMMDD); blank uses Asia/Shanghai D-1"
+        required: false
+        type: string
+      stages:
+        description: "Comma-separated stages"
+        required: true
+        default: "core,city_battle,package"
+        type: string
+      model_profile:
+        description: "DPAPI model profile ID stored on the runner"
+        required: false
+        type: string
+      dry_run:
+        description: "Plan only"
+        required: true
+        default: true
+        type: boolean
+      deploy:
+        description: "Deploy API and web after refresh"
+        required: true
+        default: false
+        type: boolean
+      request_id:
+        description: "Audit correlation ID from the dashboard"
+        required: false
+        type: string
+
+concurrency:
+  group: dashboard-daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: vars.AUTOMATION_ENABLED == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, Windows, X64, dashboard-runner]
+    timeout-minutes: 180
+    steps:
+      - name: Resolve target and run mode
+        id: config
+        shell: powershell
+        env:
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_STAGES: ${{ inputs.stages }}
+          INPUT_MODEL_PROFILE: ${{ inputs.model_profile }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_DEPLOY: ${{ inputs.deploy }}
+        run: |
+          $shanghaiNow = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow, "China Standard Time")
+          $targetDate = if ($env:INPUT_DATE) { $env:INPUT_DATE } else { $shanghaiNow.AddDays(-1).ToString("yyyyMMdd") }
+          $stages = if ($env:INPUT_STAGES) { $env:INPUT_STAGES } else { "core,city_battle,package" }
+          $isSchedule = "${{ github.event_name }}" -eq "schedule"
+          $dryRun = if ($isSchedule) { "false" } else { $env:INPUT_DRY_RUN.ToLowerInvariant() }
+          $deploy = if ($isSchedule) { "true" } else { $env:INPUT_DEPLOY.ToLowerInvariant() }
+          "target_date=$targetDate" >> $env:GITHUB_OUTPUT
+          "stages=$stages" >> $env:GITHUB_OUTPUT
+          "model_profile=$env:INPUT_MODEL_PROFILE" >> $env:GITHUB_OUTPUT
+          "dry_run=$dryRun" >> $env:GITHUB_OUTPUT
+          "deploy=$deploy" >> $env:GITHUB_OUTPUT
+
+      - name: Run serial refresh
+        shell: powershell
+        env:
+          DASHBOARD_RUNNER_ROOT: ${{ vars.DASHBOARD_RUNNER_ROOT }}
+          VERCEL_BIN: ${{ vars.VERCEL_BIN }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if (-not $env:DASHBOARD_RUNNER_ROOT) {
+            throw "Repository variable DASHBOARD_RUNNER_ROOT is not configured."
+          }
+          $python = Join-Path $env:DASHBOARD_RUNNER_ROOT ".venv\Scripts\python.exe"
+          $script = Join-Path $env:DASHBOARD_RUNNER_ROOT "daily_refresh.py"
+          if (-not (Test-Path -LiteralPath $python)) { throw "Python runtime not found at $python" }
+          if (-not (Test-Path -LiteralPath $script)) { throw "Refresh script not found at $script" }
+          $args = @(
+            $script,
+            "--date", "${{ steps.config.outputs.target_date }}",
+            "--stages", "${{ steps.config.outputs.stages }}"
+          )
+          if ("${{ steps.config.outputs.model_profile }}") {
+            $args += @("--model-profile", "${{ steps.config.outputs.model_profile }}")
+          }
+          if ("${{ steps.config.outputs.dry_run }}" -eq "true") { $args += "--dry-run" }
+          if ("${{ steps.config.outputs.deploy }}" -eq "true") { $args += "--deploy" }
+          Push-Location $env:DASHBOARD_RUNNER_ROOT
+          try {
+            & $python @args
+          } finally {
+            Pop-Location
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
